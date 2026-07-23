@@ -213,6 +213,7 @@ export function createInitialRouterState({
             writeDynamicRenderResponseIntoCache(
               Date.now(),
               FetchStrategy.PPRRuntime,
+              FetchStrategy.PPRRuntime,
               processed.flightDatas,
               processed.buildId,
               processed.isResponsePartial,

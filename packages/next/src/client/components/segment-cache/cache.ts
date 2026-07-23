@@ -27,6 +27,7 @@ import {
 import {
   createFetch,
   createFromNextReadableStream,
+  decodeBufferedStage,
   resolveShellStageData,
   type RSCResponse,
   type RequestHeaders,
@@ -235,6 +236,16 @@ export type RouteCacheEntry =
   | RejectedRouteCacheEntry
 
 type SegmentCacheEntryShared = {
+  /**
+   * The fetch strategy this entry's content EFFECTIVELY corresponds to,
+   * which may be deeper than the strategy that requested it: an entry is
+   * recorded at the tier of the payload that fully satisfied it (e.g. a
+   * shell-spawned entry fulfilled by a response whose shell IS the full
+   * response is recorded at the full tier, while still keyed at the shell
+   * vary path — valid precisely because the variants coincide). Compared
+   * via `canNewFetchStrategyProvideMoreContent` to decide whether a new
+   * request could yield more content than what's already cached.
+   */
   fetchStrategy: FetchStrategy
 
   /**
@@ -247,6 +258,36 @@ type SegmentCacheEntryShared = {
    * segments that should NOT be retried. See `SegmentPrefetchResponse`.
    */
   isUpgradeableISRFallback: boolean
+
+  /**
+   * True if a runtime prefetch would return more content for this segment
+   * than the entry contains. The scheduler uses this to decide whether a
+   * fulfilled static entry is sufficient on its own for a segment that
+   * requires runtime completeness — a StaticShell entry during the Shell
+   * phase, a PPR entry for an allow-runtime segment during the Speculative
+   * phase — or whether it must fall back to a runtime request
+   * (RuntimeShell / PPRRuntime).
+   *
+   * Derived at write time from a static per-segment response, using the SAME
+   * decode that produced this entry's data (see
+   * `SegmentPrefetchResponse['needsRuntimeRequest']` for the encoding):
+   *
+   *   (envelope `needsRuntimeRequest` settled `true` in the decode) &&
+   *   (this segment's `isPartial` pending in that decode)
+   *
+   * Reading both halves from the same decode is what makes the signal
+   * rewindable: a truncated shell decode reads a post-shell runtime access as
+   * pending, i.e. `false` — the shell variant itself doesn't need that data.
+   *
+   * The value is load-bearing in one direction only: it must never be falsely
+   * `false` (that would skip a runtime request that had more content). A
+   * falsely `true` value merely costs a wasted runtime request. Entries
+   * written from runtime responses are always `false` — they ARE runtime
+   * data. Full-variant static (PPR) writes carry the derived value too —
+   * load-bearing for allow-runtime segments, whose Speculative-phase
+   * sufficiency check consults it (see pingSegmentBundle in scheduler.ts).
+   */
+  needsRuntimeRequest: boolean
 
   // Map-related fields.
   ref: UnknownMapEntry | null
@@ -307,8 +348,10 @@ export type NonEmptySegmentCacheEntry = Exclude<
  * maps 1:1 to the data array in the SegmentPrefetchResponse the server returns.
  */
 export type SegmentBundle = {
-  // Null when the segment has prefetching disabled (instant = false).
-  // The bundle chain passes through it but no cache entry is created.
+  // Null when the segment has prefetching disabled entirely
+  // (prefetch: 'force-disabled' / instant = false; allow-runtime segments
+  // have static data and occupy a real node). The bundle chain passes
+  // through it but no cache entry is created.
   tree: RouteTree | null
   entry: SegmentCacheEntry | null
   parent: SegmentBundle | null
@@ -1082,7 +1125,7 @@ export function upsertSegmentEntry(
       return null
     }
 
-    // Ping any tasks blocked on the existing entry before evicting it so they
+    // Ping any tasks blocked on the existing entry before replacing it so they
     // re-run and pick up the new entry. Without this, tasks waiting on the
     // existing Empty/Pending entry would be stranded — the new fulfilled
     // candidate has no blockedTasks of its own.
@@ -1093,8 +1136,23 @@ export function upsertSegmentEntry(
       pingBlockedTasks(existingEntry)
     }
 
-    // Evict the existing entry from the cache.
-    deleteFromCacheMap(existingEntry)
+    // Replace the existing entry by writing the candidate over its keypath
+    // below (the same mechanism `overwriteRevalidatingSegmentCacheEntry`
+    // uses). We intentionally do NOT call `deleteFromCacheMap` first: deleting
+    // vacates the canonical slot, and `deleteMapEntry` promotes a pending
+    // Revalidation-slot entry into the vacated slot — which the immediate
+    // insert below would then silently overwrite. The in-flight revalidation
+    // would vanish from the map, so the next scheduler pass would find an
+    // empty revalidation slot and spawn a duplicate request instead of
+    // deduping against it. Replacing in place never vacates the slot, so
+    // promotion never runs and the pending revalidating entry stays in its
+    // Revalidation slot where `readOrCreateRevalidatingSegmentEntry`'s dedupe
+    // finds it.
+    //
+    // The displaced entry's map/LRU accounting is handled by the replacement
+    // itself: `setMapEntryValue` drops the displaced value's `ref` and
+    // `updateLruSize` swaps its size for the candidate's, which is exactly
+    // what delete-then-insert did.
   }
 
   const isRevalidation = false
@@ -1197,6 +1255,7 @@ export function createDetachedSegmentCacheEntry(
     rsc: null,
     isPartial: true,
     isUpgradeableISRFallback: false,
+    needsRuntimeRequest: false,
     promise: null,
 
     // Map-related fields
@@ -1302,7 +1361,11 @@ export function attemptToFulfillDynamicSegmentFromBFCache(
       dynamicPrefetchStaleAt,
       isPartial,
       // bfcache data is concrete, never an ISR fallback.
-      false
+      false,
+      // bfcache data came from a dynamic navigation response — it IS
+      // runtime data.
+      false,
+      FetchStrategy.Full
     )
   }
   return null
@@ -1340,7 +1403,11 @@ export function attemptToUpgradeSegmentFromBFCache(
       dynamicPrefetchStaleAt,
       isPartial,
       // bfcache data is concrete, never an ISR fallback.
-      false
+      false,
+      // bfcache data came from a dynamic navigation response — it IS
+      // runtime data.
+      false,
+      FetchStrategy.Full
     )
     const segmentVaryPath = getSegmentVaryPathForRequest(
       FetchStrategy.Full,
@@ -1496,7 +1563,26 @@ function fulfillSegmentCacheEntry(
   // callers pass false. Always assigned (even when false) so that re-fulfilling
   // a previously-fallback entry with a concrete response clears the flag and
   // ends the retry loop.
-  isUpgradeableISRFallback: boolean
+  isUpgradeableISRFallback: boolean,
+  // Whether a runtime prefetch would return more content for this segment
+  // than this data does. Only static per-segment responses derive a real
+  // value (see SegmentCacheEntryShared['needsRuntimeRequest']); entries
+  // written from runtime responses pass false, since they ARE runtime data.
+  // Like isUpgradeableISRFallback, always assigned so that re-fulfilling an
+  // entry replaces any previously derived value.
+  needsRuntimeRequest: boolean,
+  // The strategy tier describing the CONTENT this entry is fulfilled with —
+  // which comes from the response, not the tier the entry was requested at.
+  // Usually the two agree, but when a response's shell payload IS the full
+  // response (no shell/full split), shell-spawned entries are fulfilled with
+  // full-tier content and recorded as such (PPR / PPRRuntime; see the
+  // promotion sites in writeSegmentBundleResponse and
+  // fetchSegmentPrefetchesUsingDynamicRequest). Always assigned, replacing
+  // the spawn-time strategy set by upgradeToPendingSegment; the write walks'
+  // matching and keying decisions all happen against the spawn-time
+  // strategy, before fulfillment, so they are unaffected. See
+  // SegmentCacheEntryShared['fetchStrategy'].
+  fetchStrategy: FetchStrategy
 ): FulfilledSegmentCacheEntry {
   const fulfilledEntry: FulfilledSegmentCacheEntry = segmentCacheEntry as any
   fulfilledEntry.status = EntryStatus.Fulfilled
@@ -1504,6 +1590,8 @@ function fulfillSegmentCacheEntry(
   fulfilledEntry.staleAt = staleAt
   fulfilledEntry.isPartial = isPartial
   fulfilledEntry.isUpgradeableISRFallback = isUpgradeableISRFallback
+  fulfilledEntry.needsRuntimeRequest = needsRuntimeRequest
+  fulfilledEntry.fetchStrategy = fetchStrategy
   // Resolve any listeners that were waiting for this data.
   if (segmentCacheEntry.promise !== null) {
     segmentCacheEntry.promise.resolve(fulfilledEntry)
@@ -2255,7 +2343,11 @@ export async function fetchSegmentsOnCacheMiss(
   routeKey: RouteCacheKey,
   tree: RouteTree,
   segments: SegmentBundle,
-  segmentCount: number
+  segmentCount: number,
+  // Which walk spawned the bundle's entries. The request on the wire is
+  // identical either way; this only decides which payload of the response
+  // fulfills the entries.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
 ): Promise<PrefetchSubtaskResult<null> | null> {
   // This function is allowed to use async/await because it contains the actual
   // fetch that gets issued on a cache miss. Notice it writes the result to the
@@ -2294,16 +2386,17 @@ export async function fetchSegmentsOnCacheMiss(
     return null
   }
 
-  const { serverResponse, responseSize, closed } = result
+  const { serverResponse, shellResponse, responseSize, closed } = result
+  const now = Date.now()
 
-  // Write the decoded response into the cache, fulfilling the Pending entries
-  // this task owns.
-  writeSegmentBundleResponse(
+  writeSegmentBundleResponseVariants(
     serverResponse,
+    shellResponse,
     responseSize,
     segments,
     segmentCount,
-    Date.now()
+    now,
+    fetchStrategy
   )
 
   // If the server served an upgradeable fallback shell, drive a localized
@@ -2326,7 +2419,8 @@ export async function fetchSegmentsOnCacheMiss(
       routeKey,
       tree,
       segments,
-      segmentCount
+      segmentCount,
+      fetchStrategy
     )
   }
 
@@ -2358,6 +2452,12 @@ async function fetchSegmentsOnCacheMissImpl(
 ): Promise<{
   serverResponse: SegmentPrefetchResponse
   responseSize: number
+  // The shell payload of the response: `serverResponse` itself when the
+  // shell IS the full response (a fully static page — callers compare by
+  // reference), a second decode of the same bytes truncated at the shell
+  // byte boundary when the shell is a strict prefix, or `null` when no
+  // shell exists.
+  shellResponse: SegmentPrefetchResponse | null
   closed: Promise<void>
 } | null> {
   // Use the canonical URL to request the segment, not the original URL. These
@@ -2417,8 +2517,11 @@ async function fetchSegmentsOnCacheMissImpl(
   // buffered prefetch paths.
   const closed = createPromiseWithResolvers<void>()
 
-  const { stream: prefetchStream, size: responseSize } =
-    await createNonTaskyPrefetchResponseStream(response.body)
+  const {
+    stream: prefetchStream,
+    size: responseSize,
+    buffer,
+  } = await createNonTaskyPrefetchResponseStream(response.body)
   closed.resolve()
 
   // Parse the response. Always a SegmentPrefetchResponse with a build ID and a
@@ -2443,18 +2546,151 @@ async function fetchSegmentsOnCacheMissImpl(
     return null
   }
 
+  // Extract the shell payload, if the response carries a distinct one
+  // (positive shell byte offset): decode the buffered bytes a SECOND time,
+  // truncated at the boundary. The truncation is what produces the shell
+  // variant: each segment's param-dependent rows land past the boundary and
+  // decode as still-pending, which renders as the param fallback. It also
+  // rewinds the response's signals — `needsRuntimeRequest` and `isPartial`
+  // fulfillments past the boundary read as pending in this decode, so a
+  // post-shell runtime-data access doesn't mark the shell variant itself as
+  // needing a runtime request.
+  // (An offset that somehow isn't visible in the decode reads as 0 — no
+  // shell — the conservative direction: it can waste a runtime request but
+  // never serves the wrong content.)
+  const shellOffset = readFulfilledValue(serverResponse.a, 0)
+  let shellResponse: SegmentPrefetchResponse | null
+  if (shellOffset === null) {
+    shellResponse = serverResponse
+  } else if (shellOffset === 0) {
+    shellResponse = null
+  } else {
+    try {
+      shellResponse = await decodeBufferedStage<SegmentPrefetchResponse>(
+        buffer.subarray(0, shellOffset),
+        headers
+      )
+    } catch {
+      // The truncated prefix couldn't be decoded. Treat it as if no shell
+      // exists; the full payload is still usable. (For a StaticShell-spawned
+      // bundle this means the spawned entries are rejected — the scheduler
+      // then skips them rather than issuing a runtime substitute; see the
+      // no-shell branch in fetchSegmentsOnCacheMiss.)
+      shellResponse = null
+    }
+  }
+
   return {
     serverResponse,
     responseSize,
+    shellResponse,
     closed: closed.promise,
   }
 }
 
 /**
- * Writes a parsed segment-bundle response into the cache: distributes the
- * response size across the bundle, then walks the segments list and the
- * response array in parallel, fulfilling/upserting each entry. Any segments
- * the server didn't return are rejected so they don't stay Pending forever.
+ * Writes every payload of a parsed segment-bundle response into the cache.
+ * The bundle's entries are fulfilled by the payload matching the walk that
+ * spawned them; the other payload, when distinct, is written with a detached
+ * copy of the bundle. The full payload is written first so the shell write's
+ * shadow eviction sees the fresh concrete entry.
+ *
+ * Shared by the initial fetch (`fetchSegmentsOnCacheMiss`) and the localized
+ * fallback-retry loop. The retry's bundle entries are already settled, so
+ * for that caller every write is a detached upsert and the rejection below
+ * is a no-op (it only touches Pending entries).
+ */
+function writeSegmentBundleResponseVariants(
+  serverResponse: SegmentPrefetchResponse,
+  shellResponse: SegmentPrefetchResponse | null,
+  responseSize: number,
+  segments: SegmentBundle,
+  segmentCount: number,
+  now: number,
+  // Which walk spawned the bundle's entries; decides which payload fulfills
+  // them. See fetchSegmentsOnCacheMiss.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
+): void {
+  if (fetchStrategy === FetchStrategy.StaticShell) {
+    if (shellResponse !== serverResponse) {
+      writeSegmentBundleResponse(
+        serverResponse,
+        responseSize,
+        detachEntriesFromSegmentBundle(segments),
+        segmentCount,
+        now,
+        FetchStrategy.PPR,
+        FetchStrategy.PPR
+      )
+    }
+    if (shellResponse === null) {
+      // No shell exists. Reject the spawned entries so the task isn't
+      // stranded blocking on them. Note the scheduler does NOT fall back to
+      // a runtime request for rejected segments — it skips them outright (see
+      // the Rejected case in pingSegmentBundle in scheduler.ts), so these
+      // segments get no shell prefetch and no runtime substitute until the
+      // rejection's backoff expires.
+      rejectRemainingSegmentsInBundle(segments, now + 10 * 1000)
+    } else {
+      writeSegmentBundleResponse(
+        shellResponse,
+        responseSize,
+        segments,
+        segmentCount,
+        now,
+        FetchStrategy.StaticShell,
+        // When the shell IS the full response (no shell/full split), the
+        // entries this write fulfills carry full-tier content, so PPR is
+        // the strategy that describes it. They're still keyed at the shell
+        // vary path: that's the reusable slot, and it serves concrete
+        // fallback reads correctly precisely because the shell and concrete
+        // variants coincide.
+        shellResponse === serverResponse
+          ? FetchStrategy.PPR
+          : FetchStrategy.StaticShell
+      )
+    }
+  } else {
+    writeSegmentBundleResponse(
+      serverResponse,
+      responseSize,
+      segments,
+      segmentCount,
+      now,
+      FetchStrategy.PPR,
+      FetchStrategy.PPR
+    )
+    if (shellResponse !== null && shellResponse !== serverResponse) {
+      writeSegmentBundleResponse(
+        shellResponse,
+        responseSize,
+        detachEntriesFromSegmentBundle(segments),
+        segmentCount,
+        now,
+        FetchStrategy.StaticShell,
+        FetchStrategy.StaticShell
+      )
+    }
+  }
+}
+
+/**
+ * Writes one payload of a parsed segment-bundle response into the cache:
+ * distributes the response size across the bundle, then walks the segments
+ * list and the response's `data` array in parallel, fulfilling/upserting
+ * each entry. Any segments the server didn't return are rejected so they
+ * don't stay Pending forever.
+ *
+ * `fetchStrategy` says which of the response's payloads this call is
+ * writing — StaticShell for the shell payload, PPR for the full payload —
+ * which determines the vary paths the entries are keyed at.
+ *
+ * The walk fulfills any Pending entry in `segments`, so the caller must
+ * pass the bundle only to the walk matching the entries' own strategy, and
+ * a detached copy to the other. In particular, fulfilling a spawned
+ * StaticShell entry with the concrete payload would leak param-dependent
+ * content into shell positions: during a navigation, a pending entry can be
+ * rendered as a promise that resolves to its eventual value.
  *
  * Shared by the initial fetch and the localized fallback-retry loop (which
  * re-issues the same request and upserts the upgraded result here).
@@ -2464,9 +2700,19 @@ function writeSegmentBundleResponse(
   responseSize: number,
   segments: SegmentBundle,
   segmentCount: number,
-  now: number
+  now: number,
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell,
+  // The strategy tier that describes this payload's CONTENT, recorded on
+  // the entries it fulfills. Differs from `fetchStrategy` (which drives
+  // matching and keying) in one case: a StaticShell write whose payload IS
+  // the full response (no shell/full split) records PPR — see
+  // writeSegmentBundleResponseVariants.
+  payloadFetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
 ): void {
   // Distribute the response size evenly across all segments in the bundle.
+  // (When a response produces two payload writes, each write distributes the
+  // full response size — intentionally double-charging the LRU for one wire
+  // response, since it produced two live entries per segment.)
   const averageSize = responseSize / segmentCount
   let sizeNode: SegmentBundle | null = segments
   while (sizeNode !== null) {
@@ -2484,13 +2730,25 @@ function writeSegmentBundleResponse(
   const responseIsUpgradeableISRFallback =
     serverResponse.isUpgradeableISRFallback
 
+  // Whether the render that produced this payload accessed runtime data
+  // (page-global; combined with each segment's `isPartial` below to derive
+  // the per-entry needsRuntimeRequest value). Read from this decode's
+  // thenable status, which scopes it to the payload being written. See
+  // SegmentCacheEntryShared['needsRuntimeRequest'].
+  const responseNeedsRuntimeRequest = readFulfilledValue(
+    serverResponse.needsRuntimeRequest,
+    false
+  )
+
   let node: SegmentBundle | null = segments
   let dataIndex = 0
   while (node !== null && dataIndex < serverDataArray.length) {
     const data = serverDataArray[dataIndex]
 
-    // Null data means this segment has prefetching disabled. Skip it
-    // without creating a cache entry.
+    // Null data means this segment has prefetching disabled
+    // (prefetch: 'force-disabled' — allow-runtime segments have static data,
+    // so the server emits a real slot for them). Skip it without creating a
+    // cache entry.
     if (data === null || node.tree === null) {
       // The server's and the client's prefetch-disabled hints normally agree,
       // so there shouldn't be a spawned entry for a segment the server
@@ -2509,7 +2767,8 @@ function writeSegmentBundleResponse(
     }
 
     // The segment's late-resolving metadata can be read synchronously
-    // because the response was fully buffered before it was decoded.
+    // because the payload was fully buffered before it was decoded (and, for
+    // a truncated shell decode, delivered as a single chunk).
     const entryStaleAt = readFulfilledStaleAt(now, data.staleTime)
     // Root params are emitted once at the top level of the response and
     // unioned into each segment's set here, same as for a route-level
@@ -2520,46 +2779,103 @@ function writeSegmentBundleResponse(
     )
     const isPartial = readFulfilledIsPartial(data.isPartial)
 
-    // Determine the canonical vary path for this segment. If the server
-    // tells us which params the segment varies by, re-key to a more
-    // generic path. Otherwise use the request vary path.
-    const canonicalVaryPath =
-      process.env.__NEXT_VARY_PARAMS && varyParams !== null
-        ? getFulfilledSegmentVaryPath(node.tree.varyPath, varyParams)
-        : getSegmentVaryPathForRequest(FetchStrategy.PPR, node.tree)
+    // A runtime prefetch can only provide more content than this entry if the
+    // render accessed runtime data AND this particular segment has holes — a
+    // fully static segment gains nothing from a runtime request no matter
+    // what the page accessed.
+    const needsRuntimeRequest = responseNeedsRuntimeRequest && isPartial
 
-    let fulfilled: FulfilledSegmentCacheEntry | null = null
+    // An entry records the tier of the content that actually satisfied it:
+    // the payload's tier when the payload fully satisfied this segment
+    // (here: no runtime request needed), otherwise the tier it was
+    // requested at — so a follow-up fallback request can still
+    // supersede it.
+    const recordedFetchStrategy = !needsRuntimeRequest
+      ? payloadFetchStrategy
+      : fetchStrategy
+
+    // Determine the vary path to key the segment at. For the full payload,
+    // re-key to a more generic path if the server tells us which params the
+    // segment varies by.
+    const payloadVaryPath =
+      fetchStrategy === FetchStrategy.StaticShell
+        ? node.tree.shellVaryPath
+        : process.env.__NEXT_VARY_PARAMS && varyParams !== null
+          ? getFulfilledSegmentVaryPath(node.tree.varyPath, varyParams)
+          : getSegmentVaryPathForRequest(FetchStrategy.PPR, node.tree)
+
     const nodeEntry = node.entry
     if (nodeEntry !== null && nodeEntry.status === EntryStatus.Pending) {
       // We own this entry — fulfill it directly.
-      fulfilled = fulfillSegmentCacheEntry(
+      const fulfilledEntry = fulfillSegmentCacheEntry(
         nodeEntry as PendingSegmentCacheEntry,
         data.rsc,
         entryStaleAt,
         isPartial,
-        responseIsUpgradeableISRFallback
+        responseIsUpgradeableISRFallback,
+        needsRuntimeRequest,
+        recordedFetchStrategy
       )
+      if (fetchStrategy === FetchStrategy.StaticShell) {
+        // Re-key at the shell vary path, mirroring the RuntimeShell re-key
+        // in fulfillEntrySpawnedByRuntimePrefetch. Usually the entry already
+        // lives there, but the scheduler can also upgrade a pre-existing
+        // Empty entry at a more concrete path in place, so the re-key is
+        // load-bearing. The shadow eviction keeps a stale settled entry at
+        // a more specific path from hiding the shell entry (the just-written
+        // full payload's entry is preferred and survives it). Routed through
+        // the upsert rather than a bare set so the usual precedence rules
+        // apply: a concurrent task's response (e.g. a RuntimeShell entry)
+        // can land in the shell slot first, and this write must not
+        // downgrade it. (In the common case the slot already holds this
+        // very entry, which the upsert replaces in place.)
+        if (process.env.__NEXT_VARY_PARAMS) {
+          upsertSegmentEntry(
+            now,
+            node.tree.shellVaryPath,
+            fulfilledEntry,
+            node.tree.varyPath
+          )
+        }
+      } else {
+        // Set the fulfilled entry into the canonical cache slot. Pass the
+        // concrete lookup path — the most specific path a read for this
+        // segment position would use — so that if the canonical path is more
+        // generic (i.e. the server re-keyed the segment), any stale settled
+        // entry at a more specific path (e.g. a partial shell entry) that
+        // would shadow this one is evicted. See evictShadowingSegmentEntries.
+        upsertSegmentEntry(
+          now,
+          payloadVaryPath,
+          fulfilledEntry,
+          node.tree.varyPath
+        )
+      }
     } else {
-      // We don't own this entry. Create a detached entry and attempt
-      // to upsert it into the canonical slot.
+      // We don't own this entry. Create a detached entry and attempt to
+      // upsert it into this payload's slot.
       const detachedEntry = createDetachedSegmentCacheEntry(now)
-      fulfilled = fulfillSegmentCacheEntry(
-        // Response-write path, not a locked-navigation prefetch.
-        upgradeToPendingSegment(detachedEntry, FetchStrategy.PPR, null),
+      const fulfilledEntry = fulfillSegmentCacheEntry(
+        upgradeToPendingSegment(
+          detachedEntry,
+          fetchStrategy,
+          // Response-write path, not a locked-navigation prefetch.
+          null
+        ),
         data.rsc,
         entryStaleAt,
         isPartial,
-        responseIsUpgradeableISRFallback
+        responseIsUpgradeableISRFallback,
+        needsRuntimeRequest,
+        recordedFetchStrategy
+      )
+      upsertSegmentEntry(
+        now,
+        payloadVaryPath,
+        fulfilledEntry,
+        node.tree.varyPath
       )
     }
-
-    // Set the fulfilled entry into the canonical cache slot. Pass the
-    // concrete lookup path — the most specific path a read for this segment
-    // position would use — so that if the canonical path is more generic
-    // (i.e. the server re-keyed the segment), any stale settled entry at a
-    // more specific path (e.g. a partial shell entry) that would shadow this
-    // one is evicted. See evictShadowingSegmentEntries.
-    upsertSegmentEntry(now, canonicalVaryPath, fulfilled, node.tree.varyPath)
 
     node = node.parent
     dataIndex++
@@ -2573,7 +2889,41 @@ function writeSegmentBundleResponse(
 }
 
 /**
- * Reads a segment's partialness from its `isPartial` promise. The server
+ * Clones a SegmentBundle chain with every `entry` removed, so a write walk
+ * over it is pure detached upserts. Used for the payload that does NOT
+ * match the bundle's spawned entries (see writeSegmentBundleResponse).
+ */
+function detachEntriesFromSegmentBundle(
+  segments: SegmentBundle
+): SegmentBundle {
+  const head: SegmentBundle = {
+    tree: segments.tree,
+    entry: null,
+    parent: null,
+  }
+  let clonedTail = head
+  let node = segments.parent
+  while (node !== null) {
+    const clonedNode: SegmentBundle = {
+      tree: node.tree,
+      entry: null,
+      parent: null,
+    }
+    clonedTail.parent = clonedNode
+    clonedTail = clonedNode
+    node = node.parent
+  }
+  return head
+}
+
+// TODO: Consolidate the read* helpers below with the ones in
+// vary-params-decoding — they all perform a version of the same synchronous
+// read of a buffered decode's late-resolving values.
+
+/**
+ * Reads a segment's partialness from its `isPartial` promise. (Unlike the
+ * values read via `readFulfilledValue` below, the fulfillment value here is
+ * void — partialness is encoded as the ABSENCE of a fulfillment.) The server
  * fulfills it only for a fully-static segment and leaves it pending for a
  * partial one (see `SegmentPrefetch['isPartial']`), so partial == not
  * fulfilled. The read is synchronous because the response is fully buffered
@@ -2587,6 +2937,29 @@ function readFulfilledIsPartial(isPartial: Promise<void>): boolean {
   // stays non-fulfilled — read as partial, which is correct either way.
   thenable.then(noop, noop)
   return thenable.status !== 'fulfilled'
+}
+
+/**
+ * Reads a late-resolving value off a fully-buffered decode's thenable status,
+ * using the same trick as above. Returns `valueIfUnresolved` for a row that
+ * is pending or absent in this decode — e.g. one whose fulfillment landed
+ * past a truncated shell decode's boundary. That's what scopes a response's
+ * late-resolving signals to the payload being decoded.
+ */
+function readFulfilledValue<T>(
+  valueFromServer: Promise<T>,
+  valueIfUnresolved: T
+): T {
+  const thenable = valueFromServer as PromiseLike<T> & {
+    status?: string
+    value?: T
+  }
+  // Force Flight to unwrap a received-but-not-yet-settled row.
+  thenable.then(noop, noop)
+  if (thenable.status === 'fulfilled' && thenable.value !== undefined) {
+    return thenable.value
+  }
+  return valueIfUnresolved
 }
 
 /**
@@ -2658,7 +3031,11 @@ async function retryUpgradeableFallbackPrefetch(
   routeKey: RouteCacheKey,
   tree: RouteTree,
   segments: SegmentBundle,
-  segmentCount: number
+  segmentCount: number,
+  // The strategy the initial fetch wrote its payloads with; the upgraded
+  // result is written through the same payload fork so the same cache slots
+  // (including the shell paths) are upgraded.
+  fetchStrategy: FetchStrategy.PPR | FetchStrategy.StaticShell
 ): Promise<void> {
   for (let attempt = 0; attempt < MAX_FALLBACK_RETRIES; attempt++) {
     await new Promise<void>((resolve) =>
@@ -2690,16 +3067,23 @@ async function retryUpgradeableFallbackPrefetch(
     }
 
     // Success: the server returned the concrete (upgraded) version. Write it
-    // back through the same bundle — its entries were already fulfilled (with
-    // the fallback) by the initial fetch, so none are Pending and every segment
-    // takes the upsert path, replacing the fallback. Mark the loop fulfilled and
-    // ping the task; its other fallback segments are now allowed to revalidate.
-    writeSegmentBundleResponse(
-      result.serverResponse,
-      result.responseSize,
+    // back through the same payload fork as the initial fetch, so every slot
+    // the initial fetch wrote — including the shell paths, even when the
+    // upgraded response is fully static (shell === full) — is upgraded. The
+    // bundle's entries were already settled by the initial fetch, so every
+    // write is a detached upsert that replaces the fallback. Mark the loop
+    // fulfilled and ping the task; its other fallback segments are now
+    // allowed to revalidate.
+    const { serverResponse, shellResponse, responseSize } = result
+    const now = Date.now()
+    writeSegmentBundleResponseVariants(
+      serverResponse,
+      shellResponse,
+      responseSize,
       segments,
       segmentCount,
-      Date.now()
+      now,
+      fetchStrategy
     )
     task.fallbackRetryStatus = EntryStatus.Fulfilled
     pingPrefetchTask(task)
@@ -2946,6 +3330,20 @@ export async function fetchSegmentPrefetchesUsingDynamicRequest(
       }
     }
 
+    // The strategy tier that describes the payload's CONTENT. When the
+    // spawned entries of a RuntimeShell request are fulfilled straight from
+    // the response — a shell-only render with no extracted shell prefix —
+    // a segment whose content varies on nothing is identical to what a
+    // concrete (per-URL) runtime prefetch would return, so it's recorded at
+    // the PPRRuntime tier (per segment; see
+    // fulfillEntrySpawnedByRuntimePrefetch). Ordinary strategy-tier checks
+    // then stop redundant re-fetches, while keying is unaffected.
+    const payloadFetchStrategy =
+      fetchStrategy === FetchStrategy.RuntimeShell &&
+      serverDataThatSatisfiesSpawnedEntries === serverData
+        ? FetchStrategy.PPRRuntime
+        : fetchStrategy
+
     // Read head vary params synchronously (unioning in the response-level root
     // params). Individual segments carry their own iterables in
     // CacheNodeSeedData; the root iterable is threaded down so each segment
@@ -2988,6 +3386,7 @@ export async function fetchSegmentPrefetchesUsingDynamicRequest(
     fulfilledEntries = writeDynamicRenderResponseIntoCache(
       now,
       fetchStrategy,
+      payloadFetchStrategy,
       flightDatas,
       buildId,
       isResponsePartial,
@@ -3124,6 +3523,7 @@ function writeDynamicTreeResponseIntoCache(
   writeDynamicRenderResponseIntoCache(
     now,
     fetchStrategy,
+    fetchStrategy,
     normalizedFlightDataResult,
     buildId,
     isResponsePartial,
@@ -3153,6 +3553,16 @@ function rejectSegmentEntriesIfStillPending(
 export function writeDynamicRenderResponseIntoCache(
   now: number,
   fetchStrategy:
+    | FetchStrategy.LoadingBoundary
+    | FetchStrategy.PPR
+    | FetchStrategy.PPRRuntime
+    | FetchStrategy.RuntimeShell
+    | FetchStrategy.Full,
+  // The strategy tier that describes the payload's CONTENT — differs from
+  // `fetchStrategy` only for a RuntimeShell response with no shell/full
+  // split; see fetchSegmentPrefetchesUsingDynamicRequest and
+  // fulfillEntrySpawnedByRuntimePrefetch.
+  payloadFetchStrategy:
     | FetchStrategy.LoadingBoundary
     | FetchStrategy.PPR
     | FetchStrategy.PPRRuntime
@@ -3209,6 +3619,7 @@ export function writeDynamicRenderResponseIntoCache(
       writeSeedDataIntoCache(
         now,
         fetchStrategy,
+        payloadFetchStrategy,
         tree,
         staleAt,
         seedData,
@@ -3239,6 +3650,7 @@ export function writeDynamicRenderResponseIntoCache(
       fulfillEntrySpawnedByRuntimePrefetch(
         now,
         fetchStrategy,
+        payloadFetchStrategy,
         head,
         isHeadPartial,
         staleAt,
@@ -3276,6 +3688,13 @@ function writeSeedDataIntoCache(
     | FetchStrategy.PPRRuntime
     | FetchStrategy.RuntimeShell
     | FetchStrategy.Full,
+  // See writeDynamicRenderResponseIntoCache.
+  payloadFetchStrategy:
+    | FetchStrategy.LoadingBoundary
+    | FetchStrategy.PPR
+    | FetchStrategy.PPRRuntime
+    | FetchStrategy.RuntimeShell
+    | FetchStrategy.Full,
   tree: RouteTree,
   staleAt: number,
   seedData: CacheNodeSeedData,
@@ -3298,6 +3717,7 @@ function writeSeedDataIntoCache(
   fulfillEntrySpawnedByRuntimePrefetch(
     now,
     fetchStrategy,
+    payloadFetchStrategy,
     rsc,
     isPartial,
     staleAt,
@@ -3318,6 +3738,7 @@ function writeSeedDataIntoCache(
         writeSeedDataIntoCache(
           now,
           fetchStrategy,
+          payloadFetchStrategy,
           childTree,
           staleAt,
           childSeedData,
@@ -3338,6 +3759,13 @@ function fulfillEntrySpawnedByRuntimePrefetch(
     | FetchStrategy.PPRRuntime
     | FetchStrategy.RuntimeShell
     | FetchStrategy.Full,
+  // See writeDynamicRenderResponseIntoCache.
+  payloadFetchStrategy:
+    | FetchStrategy.LoadingBoundary
+    | FetchStrategy.PPR
+    | FetchStrategy.PPRRuntime
+    | FetchStrategy.RuntimeShell
+    | FetchStrategy.Full,
   rsc: React.ReactNode,
   isPartial: boolean,
   staleAt: number,
@@ -3348,6 +3776,19 @@ function fulfillEntrySpawnedByRuntimePrefetch(
     PendingSegmentCacheEntry
   > | null
 ) {
+  // An entry records the tier of the content that actually satisfied it:
+  // the payload's tier when the payload fully satisfied this segment
+  // (here: its content varies on nothing — the tracked vary params,
+  // unioned with the response's root params, which the shell keeps
+  // concrete, are empty — so its shell variant IS its concrete variant),
+  // otherwise the tier it was requested at — a more specific request can
+  // still return the content its shell variant omits. Keying is
+  // unaffected either way.
+  const recordedFetchStrategy =
+    segmentVaryParams !== null && segmentVaryParams.size === 0
+      ? payloadFetchStrategy
+      : fetchStrategy
+
   // Decide whether to re-key the entry under a more generic vary path based on
   // which params the segment actually depends on.
   //
@@ -3393,7 +3834,11 @@ function fulfillEntrySpawnedByRuntimePrefetch(
       staleAt,
       isPartial,
       // Dynamic-request (Full/Runtime) responses are not ISR fallbacks.
-      false
+      false,
+      // Dynamic-request responses ARE runtime data; a runtime prefetch can't
+      // provide more than what's already here.
+      false,
+      recordedFetchStrategy
     )
     if (fulfilledVaryPath !== null) {
       const isRevalidation = false
@@ -3431,7 +3876,11 @@ function fulfillEntrySpawnedByRuntimePrefetch(
         staleAt,
         isPartial,
         // Dynamic-request (Full/Runtime) responses are not ISR fallbacks.
-        false
+        false,
+        // Dynamic-request responses ARE runtime data; a runtime prefetch
+        // can't provide more than what's already here.
+        false,
+        recordedFetchStrategy
       )
       if (fulfilledVaryPath !== null) {
         const isRevalidation = false
@@ -3462,7 +3911,11 @@ function fulfillEntrySpawnedByRuntimePrefetch(
         staleAt,
         isPartial,
         // Dynamic-request (Full/Runtime) responses are not ISR fallbacks.
-        false
+        false,
+        // Dynamic-request responses ARE runtime data; a runtime prefetch
+        // can't provide more than what's already here.
+        false,
+        recordedFetchStrategy
       )
       const varyPath =
         fulfilledVaryPath !== null
@@ -3520,6 +3973,11 @@ export async function createNonTaskyPrefetchResponseStream(
 ): Promise<{
   stream: ReadableStream<Uint8Array>
   size: number
+  // The materialized response bytes backing `stream`. Exposed so callers that
+  // need to decode the same response a second time (e.g. the static App Shell
+  // extraction, which re-decodes a truncated prefix of the buffer) don't have
+  // to buffer the body twice. Most callers only use `stream` and `size`.
+  buffer: Uint8Array
 }> {
   // Buffer the entire response before passing it to the Flight client. This
   // ensures that when Flight processes the stream, all model data is available
@@ -3581,7 +4039,7 @@ export async function createNonTaskyPrefetchResponseStream(
       controller.close()
     },
   })
-  return { stream, size }
+  return { stream, size, buffer }
 }
 
 /**
@@ -3646,7 +4104,13 @@ function addSegmentPathToUrlInOutputExportMode(
  *
  * Generally, when an app uses dynamic data, a "more specific" fetch strategy is expected to provide more content:
  * - `LoadingBoundary` only provides static layouts
- * - `PPR` can provide shells for each segment (even for segments that use dynamic data)
+ * - `StaticShell` provides the App Shell variant extracted from a static response —
+ *   param-dependent content reduced to pending fallbacks, and never any content that
+ *   depends on session data (cookies, headers)
+ * - `RuntimeShell` provides the App Shell rendered by a runtime request, which can
+ *   additionally include shell content that depends on session data
+ * - `PPR` can provide shells for each segment (even for segments that use dynamic data),
+ *   including prerendered param-dependent content at concrete paths
  * - `PPRRuntime` can additionally include content that uses searchParams, params, or cookies
  * - `Full` includes all the content, even if it uses dynamic data
  *
@@ -3769,6 +4233,7 @@ export function writePrerenderResponseIntoCache(
   )
   writeDynamicRenderResponseIntoCache(
     now,
+    fetchStrategy,
     fetchStrategy,
     flightDatas,
     buildId,

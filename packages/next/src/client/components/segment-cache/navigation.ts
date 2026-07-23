@@ -586,6 +586,7 @@ async function navigateToUnknownRoute(
             writeDynamicRenderResponseIntoCache(
               now,
               FetchStrategy.PPRRuntime,
+              FetchStrategy.PPRRuntime,
               processed.flightDatas,
               processed.buildId,
               processed.isResponsePartial,
