@@ -1,4 +1,4 @@
-use std::{num::NonZeroU8, ptr::NonNull};
+use std::{borrow::Cow, num::NonZeroU8, ptr::NonNull};
 
 use triomphe::Arc;
 
@@ -47,9 +47,8 @@ pub unsafe fn restore_arc(v: TaggedValue) -> Arc<DynamicPrehashedString> {
 
 /// This can create any kind of [Atom], although this lives in the `dynamic`
 /// module.
-pub(crate) fn new_atom<T: AsRef<str> + Into<String>>(text: T) -> RcStr {
-    let text = text.as_ref();
-    if is_atom_inlineable(text) {
+pub(crate) fn new_atom(text: Cow<'_, str>) -> RcStr {
+    if is_atom_inlineable(&text) {
         let len = text.len();
         // INLINE_TAG ensures this is never zero
         let tag = INLINE_TAG_INIT | ((len as u8) << LEN_OFFSET);
@@ -63,9 +62,10 @@ pub(crate) fn new_atom<T: AsRef<str> + Into<String>>(text: T) -> RcStr {
     let hash = hash_bytes(text.as_bytes());
 
     let prehashed = DynamicPrehashedString {
-        // NOTE: This will capture as a Box<str> which will essentially
-        // `shrink_to_fit` the bytes.
-        value: text.into(),
+        value: match text {
+            Cow::Borrowed(text) => text.into(),
+            Cow::Owned(text) => text.into_boxed_str(),
+        },
         hash,
     };
     new_atom_from_prehashed(prehashed)

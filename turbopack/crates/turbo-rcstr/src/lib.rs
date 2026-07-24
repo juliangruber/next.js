@@ -745,6 +745,21 @@ mod tests {
     }
 
     #[test]
+    fn test_from_owned_reuses_allocation() {
+        let text = String::from(
+            String::from("this owned string is too long to be stored inline").into_boxed_str(),
+        );
+        assert_eq!(text.len(), text.capacity());
+        let ptr = text.as_ptr();
+
+        let rcstr = RcStr::from(text);
+        assert_eq!(rcstr.as_ptr(), ptr);
+
+        let text = rcstr.into_owned();
+        assert_eq!(text.as_ptr(), ptr);
+    }
+
+    #[test]
     fn test_rcstr() {
         // Test enough to exceed the small string optimization
         assert_eq!(rcstr!(""), RcStr::default());
